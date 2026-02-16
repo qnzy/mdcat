@@ -212,20 +212,82 @@ static int parse_sep(const char *line, Align align[], int ncols)
     return 1;
 }
 
+/*
+ * Count the number of visible terminal columns that render_inline() would
+ * occupy for the given string.
+ *
+ * Two sources of invisible/miscounted bytes:
+ *   1. Markdown markers (* _ ` and combinations) - not printed at all.
+ *   2. Multi-byte UTF-8 sequences - count as one character, not N bytes.
+ *
+ * We do not attempt full Unicode width (CJK wide chars etc.) - that would
+ * require wcwidth() which drags in locale machinery.  ASCII + Latin + the
+ * Unicode box/symbol characters found in typical Markdown docs are all
+ * single-column, so counting codepoints is sufficient here.
+ */
+static int visible_len(const char *s, int len)
+{
+    int vis = 0;
+    int i   = 0;
+
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+
+        /* backtick span: skip markers, count content codepoints + 2 spaces */
+        if (c == '`') {
+            int j = i + 1;
+            while (j < len && s[j] != '`') j++;
+            if (j < len) {
+                vis += 2;   /* padding spaces around inline code */
+                /* count codepoints between the backticks */
+                for (int k = i + 1; k < j; ) {
+                    unsigned char b = (unsigned char)s[k];
+                    if      (b < 0x80) k += 1;
+                    else if (b < 0xE0) k += 2;
+                    else if (b < 0xF0) k += 3;
+                    else               k += 4;
+                    vis++;
+                }
+                i = j + 1;
+                continue;
+            }
+            /* no closing backtick — literal char */
+            vis++; i++;
+            continue;
+        }
+
+        /* bold/italic markers: skip the run of * or _ (ASCII, 1 byte each) */
+        if (c == '*' || c == '_') {
+            int run = 0;
+            char mk = (char)c;
+            while (i + run < len && s[i + run] == mk && run < 3) run++;
+            i += run;
+            continue;
+        }
+
+        /* multi-byte UTF-8: advance past the whole codepoint, count once */
+        if      (c < 0x80) i += 1;
+        else if (c < 0xE0) i += 2;
+        else if (c < 0xF0) i += 3;
+        else               i += 4;
+        vis++;
+    }
+    return vis;
+}
+
 /* Print exactly `w` visible characters of `text`, padding with spaces. */
 static void print_cell(const char *text, int w, Align align)
 {
-    int tlen = (int)strlen(text);
-    if (tlen > w) tlen = w;   /* truncate if too wide */
+    int vlen = visible_len(text, (int)strlen(text));
+    int pad  = w - vlen;
+    if (pad < 0) pad = 0;
 
-    int pad = w - tlen;
     int lpad = 0, rpad = pad;
-
     if (align == ALIGN_CENTER) { lpad = pad / 2; rpad = pad - lpad; }
     else if (align == ALIGN_RIGHT) { lpad = pad; rpad = 0; }
 
     for (int i = 0; i < lpad; i++) putchar(' ');
-    render_inline(text, tlen);
+    render_inline(text, (int)strlen(text));
     for (int i = 0; i < rpad; i++) putchar(' ');
 }
 
@@ -319,13 +381,13 @@ static void render_table(FILE *fp,
         leftover[0] = '\0';
     }
 
-    /* Compute column widths (max of header, body) */
+    /* Compute column widths based on visible (rendered) character count */
     int widths[MAX_COLS];
     for (int c = 0; c < ncols; c++) {
-        widths[c] = (int)strlen(header_cells[c]);
-        if (widths[c] < 3) widths[c] = 3;   /* minimum readable width */
+        widths[c] = visible_len(header_cells[c], (int)strlen(header_cells[c]));
+        if (widths[c] < 3) widths[c] = 3;
         for (int r = 0; r < nrows; r++) {
-            int cw = (int)strlen(body[r][c]);
+            int cw = visible_len(body[r][c], (int)strlen(body[r][c]));
             if (cw > widths[c]) widths[c] = cw;
         }
     }
